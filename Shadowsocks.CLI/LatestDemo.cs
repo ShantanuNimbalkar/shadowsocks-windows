@@ -1,128 +1,99 @@
+using Shadowsocks.Models;
+using Splat;
+using System;
+using System.Collections.Generic;
+using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.Diagnostics;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
 namespace Shadowsocks.CLI
 {
-    public class ConfigConverter
+    internal class Program
     {
-        /// <summary>
-        /// Gets or sets whether to prefix group name to server names.
-        /// </summary>
-        public bool PrefixGroupName { get; set; }
-        
-        /// <summary>
-        /// Gets or sets the list of servers that are not in any groups.
-        /// </summary>
-        public List<Server> Servers { get; set; } = new();
-
-        public ConfigConverter(bool prefixGroupName = false) => PrefixGroupName = prefixGroupName;
-        
-        /// <summary>
-        /// Collects servers from ss:// links or SIP008 delivery links.
-        /// </summary>
-        /// <param name="uris">URLs to collect servers from.</param>
-        /// <param name="cancellationToken">A token that may be used to cancel the asynchronous operation.</param>
-        /// <returns>A task that represents the asynchronous operation.</returns>
-        public async Task FromUrls(IEnumerable<Uri> uris, CancellationToken cancellationToken = default)
+        private static Task<int> Main(string[] args)
         {
-            var sip008Links = new List<Uri>();
-
-            foreach (var uri in uris)
-            {
-                switch (uri.Scheme)
+            var clientCommand = new Command("client", "Shadowsocks client.");
+            clientCommand.AddAlias("c");
+            clientCommand.AddOption(new Option<Backend>("--backend", "Shadowsocks backend to use. Available backends: shadowsocks-rust, v2ray, legacy, pipelines."));
+            clientCommand.AddOption(new Option<string?>("--listen", "Address and port to listen on for both SOCKS5 and HTTP proxy."));
+            clientCommand.AddOption(new Option<string?>("--listen-socks", "Address and port to listen on for SOCKS5 proxy."));
+            clientCommand.AddOption(new Option<string?>("--listen-http", "Address and port to listen on for HTTP proxy."));
+            clientCommand.AddOption(new Option<string>("--server-address", "Address of the remote Shadowsocks server to connect to."));
+            clientCommand.AddOption(new Option<int>("--server-port", "Port of the remote Shadowsocks server to connect to."));
+            clientCommand.AddOption(new Option<string>("--method", "Encryption method to use for remote Shadowsocks server."));
+            clientCommand.AddOption(new Option<string?>("--password", "Password to use for remote Shadowsocks server."));
+            clientCommand.AddOption(new Option<string?>("--key", "Encryption key (NOT password!) to use for remote Shadowsocks server."));
+            clientCommand.AddOption(new Option<string?>("--plugin", "Plugin binary path."));
+            clientCommand.AddOption(new Option<string?>("--plugin-opts", "Plugin options."));
+            clientCommand.AddOption(new Option<string?>("--plugin-args", "Plugin startup arguments."));
+            clientCommand.Handler = CommandHandler.Create(
+                async (Backend backend, string? listen, string? listenSocks, string? listenHttp, string serverAddress, int serverPort, string method, string? password, string? key, string? plugin, string? pluginOpts, string? pluginArgs, CancellationToken cancellationToken) =>
                 {
-                    case "ss":
-                        {
-                            if (Server.TryParse(uri, out var server))
-                                Servers.Add(server);
-                            break;
-                        }
-
-                    case "https":
-                        sip008Links.Add(uri);
-                        break;
-                }
-            }
-
-            if (sip008Links.Count > 0)
-            {
-                var httpClient = new HttpClient
-                {
-                    Timeout = TimeSpan.FromSeconds(30.0)
-                };
-                var tasks = sip008Links.Select(async x => await httpClient.GetFromJsonAsync<Group>(x, JsonHelper.snakeCaseJsonDeserializerOptions, cancellationToken))
-                                       .ToList();
-                while (tasks.Count > 0)
-                {
-                    var finishedTask = await Task.WhenAny(tasks);
-                    var group = await finishedTask;
-                    if (group != null)
-                        Servers.AddRange(group.Servers);
-                    tasks.Remove(finishedTask);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Collects servers from SIP008 JSON files.
-        /// </summary>
-        /// <param name="paths">JSON file paths.</param>
-        /// <param name="cancellationToken">A token that may be used to cancel the read operation.</param>
-        /// <returns>A task that represents the asynchronous read operation.</returns>
-        public async Task FromSip008Json(IEnumerable<string> paths, CancellationToken cancellationToken = default)
-        {
-            foreach (var path in paths)
-            {
-                using var jsonFile = new FileStream(path, FileMode.Open);
-                var group = await JsonSerializer.DeserializeAsync<Group>(jsonFile, JsonHelper.snakeCaseJsonDeserializerOptions, cancellationToken);
-           
-            {
-                using var jsonFile = new FileStream(path, FileMode.Open);
-                var v2rayConfig = await JsonSerializer.DeserializeAsync<Interop.V2Ray.Config>(jsonFile, JsonHelper.camelCaseJsonDeserializerOptions, cancellationToken);
-                if (v2rayConfig?.Outbounds != null)
-                {
-                    foreach (var outbound in v2rayConfig.Outbounds)
+                    Locator.CurrentMutable.RegisterConstant<ConsoleLogger>(new());
+                    if (string.IsNullOrEmpty(listenSocks))
                     {
-                        if (outbound.Protocol == "shadowsocks"
-                            && outbound.Settings is JsonElement jsonElement)
-                        {
-                            var jsonText = jsonElement.GetRawText();
-                            var ssConfig = JsonSerializer.Deserialize<Interop.V2Ray.Protocols.Shadowsocks.OutboundConfigurationObject>(jsonText, JsonHelper.camelCaseJsonDeserializerOptions);
-                            if (ssConfig != null)
-                                foreach (var ssServer in ssConfig.Servers)
-                                {
-                                    var server = new Server
-                                    {
-                                        Name = outbound.Tag,
-                                        Host = ssServer.Address,
-                                        Port = ssServer.Port,
-                                        Method = ssServer.Method,
-                                        Password = ssServer.Password
-                                    };
-                                    Servers.Add(server);
-                                }
-                        }
+                        LogHost.Default.Error("You must specify SOCKS5 listen address and port.");
+                        return;
                     }
-                }
-            }
-        }
 
-        /// <summary>
-        /// Converts saved servers to ss:// URLs.
-        /// </summary>
-        /// <returns>A list of ss:// URLs.</returns>
-        public List<Uri> ToUrls()
-        {
-            var urls = new List<Uri>();
+                    Client.Legacy? legacyClient = null;
+                    Client.Pipelines? pipelinesClient = null;
 
-            foreach (var server in Servers)
-                urls.Add(server.ToUrl());
+                    switch (backend)
+                    {
+                        case Backend.SsRust:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                        case Backend.V2Ray:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                        case Backend.Legacy:
+                            if (!string.IsNullOrEmpty(password))
+                            {
+                                legacyClient = new();
+                                legacyClient.Start(listenSocks, serverAddress, serverPort, method, password, plugin, pluginOpts, pluginArgs);
+                            }
+                            else
+                                LogHost.Default.Error("The legacy backend requires password.");
+                            break;
+                        case Backend.Pipelines:
+                            pipelinesClient = new();
+                            await pipelinesClient.Start(listenSocks, serverAddress, serverPort, method, password, key, plugin, pluginOpts, pluginArgs);
+                            break;
+                        default:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                    }
 
-            return urls;
-        }
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromHours(1.00), cancellationToken);
+                        Console.WriteLine("An hour has passed.");
+                    }
 
-        /// <summary>
-        /// Converts saved servers to SIP008 JSON.
-        /// </summary>
-        /// <param name="path">JSON file path.</param>
-    File, v2rayConfig, JsonHelper.camelCaseJsonSerializerOptions, cancellationToken);
-        }
-    }
+                    switch (backend)
+                    {
+                        case Backend.SsRust:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                        case Backend.V2Ray:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                        case Backend.Legacy:
+                            legacyClient?.Stop();
+                            break;
+                        case Backend.Pipelines:
+                            pipelinesClient?.Stop();
+                            break;
+                        default:
+                            LogHost.Default.Error("Not implemented.");
+                            break;
+                    }
+                });
+
 }
